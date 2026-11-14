@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,8 +19,26 @@ import (
 	"github.com/pion/webrtc/v4/pkg/rtcerr"
 )
 
-const dataChannelBufferSize = math.MaxUint16 // message size limit for Chromium
 var errSCTPNotEstablished = errors.New("SCTP not established")
+
+// growMessageBuffer returns the size the read buffer should grow to after
+// receiving a message that did not fit in a buffer of currentSize. It never
+// grows past maxMessageSize, the largest message this peer is willing to
+// accept. The boolean is false when the message cannot fit and must be
+// rejected instead of silently truncated.
+func growMessageBuffer(currentSize int, maxMessageSize uint32) (int, bool) {
+	limit := int64(maxMessageSize)
+	if limit <= int64(currentSize) {
+		return 0, false
+	}
+
+	nextSize := int64(currentSize) * 2
+	if nextSize <= 0 || nextSize > limit {
+		nextSize = limit
+	}
+
+	return int(nextSize), true // nolint:gosec //G115 nextSize is clamped to maxMessageSize
+}
 
 // DataChannel represents a WebRTC DataChannel
 // The DataChannel interface represents a network channel
@@ -404,10 +421,25 @@ func (d *DataChannel) readLoop() {
 		d.mu.Unlock()
 		defer close(readLoopActive)
 	}()
-	buffer := make([]byte, dataChannelBufferSize)
+
+	maxMessageSize := d.api.settingEngine.getSCTPMaxMessageSize()
+	buffer := make([]byte, sctpMaxMessageSizeUnsetValue)
 	for {
 		n, isString, err := d.dataChannel.ReadDataChannel(buffer)
 		if err != nil {
+			if errors.Is(err, io.ErrShortBuffer) {
+				if nextBufferSize, ok := growMessageBuffer(len(buffer), maxMessageSize); ok {
+					buffer = make([]byte, nextBufferSize)
+
+					continue
+				}
+
+				d.log.Errorf(
+					"Incoming DataChannel message larger then Max Message size %v",
+					maxMessageSize,
+				)
+			}
+
 			d.setReadyState(DataChannelStateClosed)
 			if !errors.Is(err, io.EOF) {
 				d.onError(err)
@@ -417,11 +449,10 @@ func (d *DataChannel) readLoop() {
 			return
 		}
 
-		msg := DataChannelMessage{Data: make([]byte, n), IsString: isString}
-		copy(msg.Data, buffer[:n])
-
-		// NB: Why was DataChannelMessage not passed as a pointer value?
-		d.onMessage(msg) // nolint:staticcheck
+		d.onMessage(DataChannelMessage{
+			Data:     append([]byte{}, buffer[:n]...),
+			IsString: isString,
+		})
 	}
 }
 
