@@ -13,7 +13,6 @@ import (
 
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/webrtc/v4/internal/fmtp"
 )
 
 // RTPTransceiver represents a combination of an RTPSender and an RTPReceiver that share a common mid.
@@ -107,9 +106,17 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 	// the transceivers codecs and use payload type registered to
 	// media engine.
 	payloadMapping := make(map[PayloadType]PayloadType) // for RTX re-mapping later
+	// orderedRemotePayloadTypes keeps the remote primary payload types in
+	// negotiation order so RTX codecs are attached deterministically (map
+	// iteration order is randomized in Go).
+	orderedRemotePayloadTypes := []PayloadType{}
 	filterByMatchType := func(matchFilter codecMatchType) []RTPCodecParameters {
 		filteredCodecs := []RTPCodecParameters{}
-		for remoteCodecIdx := len(remoteCodecs) - 1; remoteCodecIdx >= 0; remoteCodecIdx-- {
+		// Walk the remote codecs in negotiation order so each remote codec
+		// consumes the best matching local codec before later remote codecs
+		// are considered. Iterating in reverse would let a later remote codec
+		// claim a local variant that an earlier one should have been mapped to.
+		for remoteCodecIdx := 0; remoteCodecIdx < len(remoteCodecs); remoteCodecIdx++ {
 			remoteCodec := remoteCodecs[remoteCodecIdx]
 			if strings.EqualFold(remoteCodec.RTPCodecCapability.MimeType, MimeTypeRTX) {
 				continue
@@ -120,31 +127,25 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 				leftCodecs,
 			)
 			if matchType == matchFilter {
+				orderedRemotePayloadTypes = append(orderedRemotePayloadTypes, remoteCodec.PayloadType)
 				payloadMapping[remoteCodec.PayloadType] = matchCodec.PayloadType
 
 				remoteCodec.PayloadType = matchCodec.PayloadType
-				filteredCodecs = append([]RTPCodecParameters{remoteCodec}, filteredCodecs...)
+				filteredCodecs = append(filteredCodecs, remoteCodec)
 
 				// removed matched codec for next round
 				remoteCodecs = append(remoteCodecs[:remoteCodecIdx], remoteCodecs[remoteCodecIdx+1:]...)
+				remoteCodecIdx--
 
-				needleFmtp := fmtp.Parse(
-					matchCodec.RTPCodecCapability.MimeType,
-					matchCodec.RTPCodecCapability.ClockRate,
-					matchCodec.RTPCodecCapability.Channels,
-					matchCodec.RTPCodecCapability.SDPFmtpLine,
-				)
-
+				// Remove exactly the local codec that was matched so each local
+				// codec is applied only once. A compatibility-based fmtp Match
+				// cannot be used here: codecs with different media formats may be
+				// compatible (e.g. two H.265 formats that only differ in level-id),
+				// and removing the whole compatibility group would make later
+				// remote codecs fall back to an already used payload type.
 				for leftCodecIdx := len(leftCodecs) - 1; leftCodecIdx >= 0; leftCodecIdx-- {
-					leftCodec := leftCodecs[leftCodecIdx]
-					leftCodecFmtp := fmtp.Parse(
-						leftCodec.RTPCodecCapability.MimeType,
-						leftCodec.RTPCodecCapability.ClockRate,
-						leftCodec.RTPCodecCapability.Channels,
-						leftCodec.RTPCodecCapability.SDPFmtpLine,
-					)
-
-					if needleFmtp.Match(leftCodecFmtp) {
+					if leftCodecs[leftCodecIdx].PayloadType == matchCodec.PayloadType &&
+						strings.EqualFold(leftCodecs[leftCodecIdx].MimeType, matchCodec.MimeType) {
 						leftCodecs = append(leftCodecs[:leftCodecIdx], leftCodecs[leftCodecIdx+1:]...)
 
 						break
@@ -159,8 +160,9 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 	filteredCodecs := filterByMatchType(codecMatchExact)
 	filteredCodecs = append(filteredCodecs, filterByMatchType(codecMatchPartial)...)
 
-	// find RTX associations and add those
-	for remotePayloadType, mediaEnginePayloadType := range payloadMapping {
+	// find RTX associations and add those, in remote negotiation order
+	for _, remotePayloadType := range orderedRemotePayloadTypes {
+		mediaEnginePayloadType := payloadMapping[remotePayloadType]
 		remoteRTX := findRTXPayloadType(remotePayloadType, remoteCodecs)
 		if remoteRTX == PayloadType(0) {
 			continue
