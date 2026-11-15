@@ -697,6 +697,75 @@ func TestHaveApplicationMediaSection(t *testing.T) {
 	})
 }
 
+func TestHaveRTPMedia(t *testing.T) {
+	t.Run("data channel only", func(t *testing.T) {
+		descr := &SessionDescription{
+			parsed: &sdp.SessionDescription{
+				MediaDescriptions: []*sdp.MediaDescription{
+					{MediaName: sdp.MediaName{Media: mediaSectionApplication, Port: sdp.RangedPort{Value: 9}}},
+				},
+			},
+		}
+
+		assert.False(t, haveRTPMedia(descr))
+	})
+
+	t.Run("audio media", func(t *testing.T) {
+		descr := &SessionDescription{
+			parsed: &sdp.SessionDescription{
+				MediaDescriptions: []*sdp.MediaDescription{
+					{MediaName: sdp.MediaName{Media: "audio", Port: sdp.RangedPort{Value: 9}}},
+				},
+			},
+		}
+
+		assert.True(t, haveRTPMedia(descr))
+	})
+
+	t.Run("data channel then video", func(t *testing.T) {
+		descr := &SessionDescription{
+			parsed: &sdp.SessionDescription{
+				MediaDescriptions: []*sdp.MediaDescription{
+					{MediaName: sdp.MediaName{Media: mediaSectionApplication, Port: sdp.RangedPort{Value: 9}}},
+					{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 9}}},
+				},
+			},
+		}
+
+		assert.True(t, haveRTPMedia(descr))
+	})
+
+	t.Run("rejected zero-port media section", func(t *testing.T) {
+		descr := &SessionDescription{
+			parsed: &sdp.SessionDescription{
+				MediaDescriptions: []*sdp.MediaDescription{
+					{MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 0}}},
+					{MediaName: sdp.MediaName{Media: mediaSectionApplication, Port: sdp.RangedPort{Value: 9}}},
+				},
+			},
+		}
+
+		assert.False(t, haveRTPMedia(descr))
+	})
+
+	t.Run("zero-port bundle-only media section still counts", func(t *testing.T) {
+		descr := &SessionDescription{
+			parsed: &sdp.SessionDescription{
+				MediaDescriptions: []*sdp.MediaDescription{
+					{
+						MediaName: sdp.MediaName{Media: "video", Port: sdp.RangedPort{Value: 0}},
+						Attributes: []sdp.Attribute{
+							{Key: "bundle-only"},
+						},
+					},
+				},
+			},
+		}
+
+		assert.True(t, haveRTPMedia(descr))
+	})
+}
+
 func TestMediaDescriptionFingerprints(t *testing.T) {
 	engine := &MediaEngine{}
 	assert.NoError(t, engine.RegisterDefaultCodecs())

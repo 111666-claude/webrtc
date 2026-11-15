@@ -1122,6 +1122,24 @@ func haveDataChannel(desc *SessionDescription) *sdp.MediaDescription {
 	return nil
 }
 
+// haveRTPMedia reports whether the description carries an active RTP media
+// section (audio or video). Application (data channel) sections and rejected
+// sections (port zero without a=bundle-only) do not count.
+func haveRTPMedia(desc *SessionDescription) bool {
+	for _, d := range desc.parsed.MediaDescriptions {
+		if d.MediaName.Media == mediaSectionApplication {
+			continue
+		}
+		if _, bundleOnly := d.Attribute("bundle-only"); d.MediaName.Port.Value == 0 && !bundleOnly {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
 func codecsFromMediaDescription(mediaDescr *sdp.MediaDescription) (out []RTPCodecParameters, err error) {
 	s := &sdp.SessionDescription{
 		MediaDescriptions: []*sdp.MediaDescription{mediaDescr},

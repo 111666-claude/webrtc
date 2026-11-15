@@ -61,6 +61,11 @@ type PeerConnection struct {
 	isGracefulCloseDone                     chan struct{}
 	isNegotiationNeeded                     *atomic.Bool
 	updateNegotiationNeededFlagOnEmptyChain *atomic.Bool
+	// undeclaredMediaProcessorStarted guards the one-time start of the
+	// undeclared RTP/RTCP processors, which are only useful when an RTP media
+	// section has actually been negotiated. A data-channel-only connection
+	// must never start them; a later renegotiation that adds media starts them.
+	undeclaredMediaProcessorStarted *atomic.Bool
 
 	lastOffer  string
 	lastAnswer string
@@ -133,6 +138,7 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 		isGracefulCloseDone:                     make(chan struct{}),
 		isNegotiationNeeded:                     &atomic.Bool{},
 		updateNegotiationNeededFlagOnEmptyChain: &atomic.Bool{},
+		undeclaredMediaProcessorStarted:         &atomic.Bool{},
 		lastOffer:                               "",
 		lastAnswer:                              "",
 		greaterMid:                              -1,
@@ -1191,7 +1197,7 @@ func (pc *PeerConnection) SetLocalDescription(desc SessionDescription) error {
 		}
 		pc.configureRTPReceivers(haveLocalDescription, remoteDesc, currentTransceivers)
 		pc.ops.Enqueue(func() {
-			pc.startRTP(haveLocalDescription, remoteDesc, currentTransceivers)
+			pc.startRTP(remoteDesc, currentTransceivers)
 		})
 	}
 
@@ -1403,7 +1409,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 			}
 			pc.configureRTPReceivers(true, &desc, currentTransceivers)
 			pc.ops.Enqueue(func() {
-				pc.startRTP(true, &desc, currentTransceivers)
+				pc.startRTP(&desc, currentTransceivers)
 			})
 		}
 
@@ -1459,7 +1465,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 			remoteCryptexMode,
 		)
 		if weOffer {
-			pc.startRTP(false, &desc, currentTransceivers)
+			pc.startRTP(&desc, currentTransceivers)
 		}
 	})
 
@@ -2252,6 +2258,14 @@ func (pc *PeerConnection) handleIncomingSSRC(rtpStream *srtp.ReadStreamSRTP, ssr
 
 // undeclaredMediaProcessor handles RTP/RTCP packets that don't match any a:ssrc lines.
 func (pc *PeerConnection) undeclaredMediaProcessor() {
+	// Only a single pair of processor goroutines exists per PeerConnection. A
+	// data-channel-only connection never starts them; once an RTP media section
+	// is negotiated (possibly via a later renegotiation), they start once and
+	// live until the DTLS transport (and therefore its SRTP sessions) closes.
+	if !pc.undeclaredMediaProcessorStarted.CompareAndSwap(false, true) {
+		return
+	}
+
 	go pc.undeclaredRTPMediaProcessor()
 	go pc.undeclaredRTCPMediaProcessor()
 }
@@ -3116,11 +3130,14 @@ func (pc *PeerConnection) startTransports(
 
 // nolint: gocognit
 func (pc *PeerConnection) startRTP(
-	isRenegotiation bool,
 	remoteDesc *SessionDescription,
 	currentTransceivers []*RTPTransceiver,
 ) {
-	if !isRenegotiation {
+	// The undeclared-media processors only make sense for a connection that
+	// actually negotiates RTP media. Starting them for a data-channel-only
+	// connection would leave idle goroutines blocked on empty SRTP sessions.
+	// They are started once and kept running for later renegotiations.
+	if haveRTPMedia(remoteDesc) {
 		pc.undeclaredMediaProcessor()
 	}
 
